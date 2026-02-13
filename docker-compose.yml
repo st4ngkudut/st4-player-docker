@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  st4player:
+    build: .
+    container_name: st4player
+    restart: unless-stopped
+    network_mode: "host"  # Biar IP container sama dengan IP STB
+    privileged: true      # PENTING: Biar bisa akses hardware (Sound & Serial) & nsenter
+    devices:
+      - /dev/snd:/dev/snd           # Akses Soundcard
+      - /dev/ttyAML0:/dev/ttyAML0   # Akses Serial Internal (Sesuaikan port lu)
+      # - /dev/ttyUSB0:/dev/ttyUSB0 # Uncomment kalau pake USB-TTL eksternal
+    volumes:
+      - .:/app                      # Biar bisa edit codingan langsung update tanpa rebuild
+      - /tmp:/tmp                   # Mapping socket folder
+    environment:
+      - TERM=xterm
