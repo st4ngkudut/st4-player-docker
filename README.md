@@ -1,91 +1,133 @@
-# ST4 Player (Audiophile STB Music Server)
+# ST4 Player (Audiophile STB Music Server - Hybrid Edition)
 
 **ST4 Player** adalah aplikasi pemutar musik *headless* berbasis Python
 & Flask yang dirancang khusus untuk berjalan di **STB OpenWrt (Amlogic
 HG680P/B860H)** via Docker.
 
-Aplikasi ini mengubah STB bekas menjadi **Music Server Audiophile**
-dengan kemampuan DSP (EQ, Crossfeed), integrasi YouTube Music, dan
-kontrol hardware dua arah melalui Serial Port (UART) ke Remote/Display
-eksternal (ESP8266).
+Versi ini menggunakan sistem **Komunikasi Hybrid**:
 
-![ST4 Player UI](static/img/default.png)
+-   **WiFi (HTTP)** ’ Jalur utama untuk kontrol cepat, browsing file,
+    dan pengambilan metadata (Judul, Cover, Stats) ke Remote ESP8266.
+-   **Serial (UART)** ’ Jalur khusus untuk fitur OTA Flasher (flash
+    firmware ESP tanpa kabel USB) dan backup stream.
 
 ------------------------------------------------------------------------
 
 ## Fitur Utama
 
--   **Playback Engine:** Menggunakan `mpv` untuk kualitas audio tinggi
-    (FLAC, MP3, WAV, AAC, DSD via DoP).
--   **Web Interface:** Antarmuka responsif untuk kontrol, manajemen
-    playlist, dan file browser.
--   **DSP & Audio Processing:**
-    -   10-Band Equalizer dengan Preset.
-    -   **Bitperfect Mode:** Bypass semua filter untuk audio murni.
-    -   **Crossfeed (CMoy):** Simulasi speaker untuk headphone.
--   **YouTube Music Integration:** Cari, putar, dan **download** lagu
-    dari YT Music.
--   **Hardware Integration (Serial/UART):**
-    -   Mengirim metadata lagu ke display eksternal.
-    -   Menerima perintah fisik (Knob/Tombol) dari hardware eksternal.
-    -   **OTA Flasher:** Flash firmware ESP8266 langsung dari Web UI
-        STB.
+### Playback Engine
+
+Menggunakan **mpv** untuk kualitas audio tinggi (FLAC, MP3, WAV, AAC,
+DSD via DoP).
+
+### Web Interface
+
+Antarmuka responsif untuk manajemen playlist, kontrol playback, dan
+konfigurasi sistem.
+
+### DSP & Audio Processing
+
+-   10-Band Equalizer (Preset & Manual)
+-   Bitperfect Mode (bypass software mixer)
+-   Crossfeed (CMoy)
+-   Balance L/R Channel
+
+### Remote Control Canggih (ESP8266)
+
+-   OLED display metadata realtime
+-   Progress bar playback
+-   File browser langsung dari remote
+-   System monitor:
+    -   CPU temperature
+    -   RAM usage
+    -   Disk usage
+    -   Internet speed (DL / UL)
+-   Tools:
+    -   Ping test
+    -   Clean RAM
+    -   Reboot STB
+
+### YouTube Music Integration
+
+Cari, putar, dan download lagu langsung ke storage lokal.
+
+### OTA Flasher
+
+Flash firmware ESP8266 langsung dari Web UI STB via kabel serial.
 
 ------------------------------------------------------------------------
 
-## Prasyarat Hardware
+## 1. Prasyarat Hardware
 
-1.  **STB Amlogic** (HG680P, B860H, dll) dengan firmware **OpenWrt**.
-2.  **USB DAC** (Opsional, sangat disarankan).
-3.  **Koneksi Serial:** Pin UART internal STB (GND, TX, RX) terhubung ke
-    ESP8266/ESP32.
+### STB
+
+-   Amlogic HG680P / B860H / sejenis
+-   Firmware OpenWrt
+
+### Audio
+
+-   USB DAC (sangat disarankan)
+
+### Remote Hardware
+
+-   ESP8266 (NodeMCU / Wemos D1 Mini)
+-   OLED 128x64 (SPI / I2C)
+-   Rotary Encoder
+
+### Koneksi
+
+-   STB dan ESP harus dalam jaringan WiFi / LAN yang sama
+-   Kabel serial jumper:
+    -   GND > GND
+    -   TX STB > RX ESP
+    -   RX STB > TX ESP
+
+(Wajib untuk fitur flasher)
 
 ------------------------------------------------------------------------
 
 ## Instalasi (Docker)
 
-Metode ini paling bersih dan aman untuk sistem OpenWrt.
-
-### 1. Persiapan Sistem (Host OpenWrt)
-
-Matikan akses console sistem ke serial port `/dev/ttyAML0` agar bisa
-dipakai Python.
-
-1.  SSH ke STB
-
-2.  Edit file inittab:
-
-    ``` bash
-    nano /etc/inittab
-    ```
-
-3.  Beri tanda `#` pada baris ttyAML0:
-
-    ``` text
-    # ::askconsole:/usr/libexec/login.sh ttyAML0
-    ```
-
-4.  **Reboot STB**
+Metode paling bersih dan aman untuk OpenWrt.
 
 ------------------------------------------------------------------------
 
-### 2. Build Docker Image
+### 1. Persiapan Sistem OpenWrt ( OPSIONAL / Bisa di skip )
 
-Lakukan build langsung di STB (pastikan koneksi internet lancar).
+Matikan console serial agar bisa dipakai Python.
 
 ``` bash
-cd /root/st4-player
+nano /etc/inittab
+```
 
-# Gunakan --network=host agar proses build bisa akses internet
+Comment:
+
+    # ::askconsole:/usr/libexec/login.sh ttyAML0
+
+Reboot STB.
+
+------------------------------------------------------------------------
+
+### 2. Siapkan File Database (WAJIB)
+
+``` bash
+cd /root && git clone https://github.com/st4ngkudut/st4-player-docker.git
+cd /root/st4-player-docker
+touch music.db
+echo "[]" > playlist.json
+```
+
+------------------------------------------------------------------------
+
+### 3. Build Docker Image
+
+``` bash
 docker build --network=host -t st4player .
 ```
 
 ------------------------------------------------------------------------
 
-### 3. Jalankan Container
-
-Jalankan perintah berikut.\
-**PENTING:** Sesuaikan path volume (`-v`) dengan lokasi lagu Anda.
+### 4. Jalankan Container
 
 ``` bash
 docker run -d \
@@ -95,106 +137,87 @@ docker run -d \
   --privileged \
   --device /dev/snd:/dev/snd \
   --device /dev/ttyAML0:/dev/ttyAML0 \
-  -v /root/st4-player/music.db:/app/music.db \
-  -v /root/st4-player/playlist.json:/app/playlist.json \
+  -v "$PWD/music.db":/app/music.db \
+  -v "$PWD/playlist.json":/app/playlist.json \
   -v /mnt/mmcblk2p4/music:/music \
   -e TZ=Asia/Jakarta \
   st4player
 ```
 
-**Catatan:**\
-Ganti `/mnt/mmcblk2p4/music` dengan path folder musik di harddisk
-eksternal / SD Card Anda.
+------------------------------------------------------------------------
+
+## API Endpoints (Hybrid Remote)
+
+Digunakan oleh ESP8266 via WiFi.
+
+  Method   Endpoint               Fungsi
+  -------- ---------------------- -------------------
+  GET      /status                Status player
+  GET      /browser/list          List file browser
+  GET      /browser/play_file     Play file
+  GET      /browser/play_folder   Play folder
+  GET      /system/stats          CPU, RAM, Disk
+  GET      /system/net_stats      Speed internet
+  GET      /system/exec_cmd       Tools system
+  GET      /control/eq            Set equalizer
+  GET      /control/balance       Set balance
+  GET      /play?url=             Play URL / path
 
 ------------------------------------------------------------------------
 
-## Struktur Direktori
+## ðŸ”Œ Protokol Komunikasi
 
-    /st4-player
-    â”œâ”€â”€ app.py              # Logic Utama (Flask)
-    â”œâ”€â”€ library.py          # Modul Scanner Lagu
-    â”œâ”€â”€ play.sh             # Script Wrapper MPV
-    â”œâ”€â”€ Dockerfile          # Config Docker
-    â”œâ”€â”€ requirements.txt    # Python Libs
-    â”œâ”€â”€ static/             # Assets Web (CSS/JS)
-    â”œâ”€â”€ templates/          # HTML Files
-    â””â”€â”€ music.db            # Database (Auto-generated)
+### 1. WiFi HTTP (Primary)
 
-------------------------------------------------------------------------
+-   ESP kirim perintah ke STB
+-   ESP polling JSON untuk update OLED
 
-## API Endpoints & Serial
+### 2. Serial UART (Secondary)
 
-### HTTP API
-
-  Method   Endpoint                  Deskripsi
-  -------- ------------------------- -------------------------------
-  GET      /status                   Cek status player (JSON)
-  GET      /play?url={link}          Putar lagu (lokal / URL)
-  GET      /control/{action}         play, pause, next, prev, stop
-  GET      /control/volume?val=XX    Set volume (0-100)
-  GET      /download_song?id={vid}   Download dari YT Music
-
-------------------------------------------------------------------------
-
-### Serial Protocol (UART)
-
-Baudrate: **115200**
-
-#### STB ESP (JSON Line)
-
-``` json
-{"title": "Song", "artist": "Band", "status": "playing", "volume": 50}
-```
-
-#### ESP STB (String Command + newline)
-
-    cmd:play
-    cmd:pause
-    cmd:next
-    cmd:prev
-    cmd:volume=80
+-   Baudrate 115200
+-   Untuk OTA flash firmware ESP
+-   Tidak perlu lepas hardware
 
 ------------------------------------------------------------------------
 
 ## Troubleshooting
 
-### Build Error (Network)
+### Remote tidak konek
 
-Selalu gunakan flag:
+-   Pastikan IP STB tidak berubah
+-   Reconfig WiFi remote jika perlu
 
-    --network=host
+------------------------------------------------------------------------
 
-### Tidak Ada Suara
+### socat connection refused
 
--   Pastikan device audio terpasang:
+Normal saat MPV belum siap.
 
-        --device /dev/snd:/dev/snd
+------------------------------------------------------------------------
 
--   Cek volume host:
+### Docker mount error
 
-        alsamixer
+Pastikan file database sudah dibuat sebelum run.
 
--   Cek file audio valid.
+------------------------------------------------------------------------
 
-### Serial Error / Flashing Gagal
+### Tidak ada suara
 
--   Pastikan `/etc/inittab` sudah diedit & STB sudah reboot.
--   Cek kabel:
-    -   TX STB â†’ RX ESP
-    -   RX STB â†’ TX ESP
-    -   GND harus menyatu.
+Cek:
 
-### Lagu Tidak Terbaca
-
--   Cek mounting volume `-v`.
--   Gunakan menu **Rescan Library** di Web UI.
+``` bash
+aplay -l
+alsamixer
+```
 
 ------------------------------------------------------------------------
 
 ## License
 
-Project ini dibuat untuk edukasi dan hobi.
+Project komunitas OpenWrt Indonesia.
 
-Based on: - Flask\
-- MPV\
-- YT-DLP
+Stack: - Flask - Arduino C++ - MPV - Docker
+
+------------------------------------------------------------------------
+
+Happy Listening!
