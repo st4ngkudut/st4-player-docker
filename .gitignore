@@ -1,0 +1,7 @@
+static/covers/
+__pycache__/
+*.pyc
+music.db
+state_bp_mode
+.env
+

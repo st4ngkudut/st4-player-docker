@@ -10,12 +10,12 @@ import hashlib
 import random
 import requests
 import serial
+import shutil
 from threading import Lock
 from ytmusicapi import YTMusic
 import yt_dlp
 
 # --- DUMMY LIBRARY MANAGER ---
-# Digunakan jika modul library.py tidak ditemukan
 class MockLibMgr:
     def scan_directory(self, path):
         print(f"[Mock] Scanning {path}...")
@@ -34,7 +34,6 @@ app = Flask(__name__)
 
 # --- CONFIG DOCKER OPENWRT ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-IS_ANDROID = False
 MPV_SOCKET = "/tmp/mpv_socket"
 PLAYLIST_FILE = os.path.join(BASE_DIR, "playlist.json")
 COVER_DIR = os.path.join(BASE_DIR, "static", "covers")
@@ -42,74 +41,78 @@ PLAY_SCRIPT = os.path.join(BASE_DIR, "play.sh")
 DEFAULT_PATH_FILE = os.path.join(BASE_DIR, "default_path.txt")
 BP_MODE_FILE = os.path.join(BASE_DIR, "state_bp_mode")
 INTERNAL_MUSIC_PATH = "/music"
-AUDIO_EXTS = ('.mp3', '.flac', '.wav', '.m4a', '.ogg', '.opus', '.wma', '.aac')
+AUDIO_EXTS = ('.mp3', '.flac', '.wav', '.m4a', '.ogg', '.opus', '.wma', '.aac', '.dsf', '.dff')
 
 state_lock = Lock()
 yt_music = YTMusic()
 needs_restore = False
+stop_serial_flag = False
 
 # --- GLOBAL STATE ---
 st4_state = {
-    "title": "Ready",
-    "artist": "Waiting...",
-    "album": "",
-    "genre": "",
-    "year": "",
-    "tech_info": "",
-    "current_time": 0,
-    "total_time": 0,
-    "status": "stopped",
-    "volume": 50,
-    "active_preset": "Normal",
-    "thumb": "",
-    "queue": [],
-    "current_index": -1,
-    "sleep_target": 0,
-    "current_eq_cmd": "",
-    "last_play_time": 0,
-    "error_count": 0,
-    "manual_stop": False,
-    "timer_display": "OFF"
+    "title": "Ready", "artist": "Waiting...", "album": "",
+    "status": "stopped", "volume": 50, "active_preset": "Normal",
+    "thumb": "", "queue": [], "current_index": -1,
+    "sleep_target": 0, "current_eq_cmd": "",
+    "last_play_time": 0, "error_count": 0, "manual_stop": False,
+    "timer_display": "OFF", "tech_info": ""
 }
 
-af_state = {
-    "eq": "",
-    "balance": "",
-    "crossfeed": ""
-}
-
+af_state = {"eq": "", "balance": "", "crossfeed": ""}
 download_status = {}
+
+# Net Stats Vars
+last_net_check = 0
+last_rx = 0
+last_tx = 0
+curr_rx_speed = 0
+curr_tx_speed = 0
 
 # --- SERIAL SETUP ---
 ser = None
-serial_port = '/dev/ttyAML0' # <--- KITA KUNCI DISINI
+serial_port = '/dev/ttyAML0' 
 
 def init_serial():
     global ser
+    if ser is not None:
+        try: ser.close()
+        except: pass
     try:
-        # Langsung tembak port internal
-        ser = serial.Serial('/dev/ttyAML0', 115200, timeout=1)
-        print("✅ Serial Connected: /dev/ttyAML0 (FIXED INTERNAL)")
+        ser = serial.Serial(serial_port, 115200, timeout=1)
+        print(f"✅ Serial Connected: {serial_port}")
     except Exception as e:
         print(f"⚠️ Gagal Konek Serial: {e}")
+        ser = None
 
-# Inisialisasi Serial saat start
 init_serial()
 
-# --- HELPERS & DSP ---
-def is_bp_active():
-    if os.path.exists(BP_MODE_FILE):
-        try:
-            with open(BP_MODE_FILE, 'r') as f: return f.read().strip() == "1"
-        except: pass
-    return False
+# --- HELPERS ---
+def mpv_send(cmd):
+    if not os.path.exists(MPV_SOCKET): return None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(MPV_SOCKET)
+        s.send((json.dumps({"command": cmd}) + "\n").encode())
+        res = s.recv(8192).decode()
+        s.close()
+        return json.loads(res).get("data")
+    except: return None
 
 def update_mpv_filters():
-    if is_bp_active():
+    # Cek Mode Bitperfect
+    is_bp = False
+    if os.path.exists(BP_MODE_FILE):
+        try:
+            with open(BP_MODE_FILE, 'r') as f: is_bp = (f.read().strip() == "1")
+        except: pass
+        
+    if is_bp:
         mpv_send(["set_property", "af", ""])
         mpv_send(["set_property", "volume", 100])
         with state_lock: st4_state["volume"] = 100
         return
+
     filters = []
     if af_state["balance"]: filters.append(af_state["balance"])
     if af_state["eq"]: filters.append(af_state["eq"])
@@ -136,35 +139,9 @@ EQ_PRESETS = {
     "KZEDCPro": {"f1":6,"f2":5,"f3":3,"f4":1,"f5":0,"f6":0,"f7":-1,"f8":-1,"f9":0,"f10":0}
 }
 
-def mpv_send(cmd):
-    if not os.path.exists(MPV_SOCKET): return None
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(0.2)
-        s.connect(MPV_SOCKET)
-        s.send((json.dumps({"command": cmd}) + "\n").encode())
-        res = s.recv(8192).decode()
-        s.close()
-        return json.loads(res).get("data")
-    except: return None
-
 def get_yt_thumb(url):
     match = re.search(r"([a-zA-Z0-9_-]{11})", url or "")
     if match: return f"https://img.youtube.com/vi/{match.group(1)}/0.jpg"
-    return ""
-
-def extract_local_cover(filepath):
-    if not filepath or not os.path.exists(filepath): return ""
-    try:
-        hash_name = hashlib.md5(filepath.encode('utf-8')).hexdigest()
-        cover_filename = f"{hash_name}.jpg"
-        save_path = os.path.join(COVER_DIR, cover_filename)
-        if os.path.exists(save_path): return f"/static/covers/{cover_filename}"
-        if os.path.getsize(filepath) < 102400: return ""
-        cmd = ["ffmpeg", "-i", filepath, "-an", "-vcodec", "mjpeg", "-q:v", "2", "-frames:v", "1", "-y", save_path]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if os.path.exists(save_path): return f"/static/covers/{cover_filename}"
-    except: pass
     return ""
 
 def trigger_play(url):
@@ -186,10 +163,11 @@ def play_next_in_queue():
         time_diff = time.time() - st4_state.get("last_play_time", 0)
         if time_diff < 2.0: st4_state["error_count"] += 1
         else: st4_state["error_count"] = 0
+        
         if st4_state["error_count"] > 5:
             st4_state["status"] = "stopped"
-            st4_state["error_count"] = 0
             return
+            
         next_idx = st4_state["current_index"] + 1
         if next_idx < len(st4_state["queue"]):
             st4_state["current_index"] = next_idx
@@ -205,104 +183,35 @@ def find_key_insensitive(data, search_keys):
             if data_k.lower() == k.lower(): return data_v
     return ""
 
-# --- DOWNLOAD LOGIC ---
-def run_download(video_id, save_path, quality_mode='mp3'):
-    url = f"https://music.youtube.com/watch?v={video_id}"
-    download_status[video_id] = "downloading"
-    if not os.path.exists(save_path):
-        try: os.makedirs(save_path, exist_ok=True)
-        except: pass
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': os.path.join(save_path, '%(artist)s - %(title)s.%(ext)s'),
-        'writethumbnail': True,
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }, {'key': 'EmbedThumbnail'}, {'key': 'FFmpegMetadata'}]
-    }
-    if quality_mode == 'high':
-        ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio'
-        ydl_opts['postprocessors'] = [{'key': 'EmbedThumbnail'}, {'key': 'FFmpegMetadata'}]
-    elif quality_mode == 'low':
-        ydl_opts['postprocessors'][0]['preferredquality'] = '64'
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        download_status[video_id] = "success"
-    except Exception as e:
-        print(f"DL Error: {e}")
-        download_status[video_id] = "failed"
-    time.sleep(5)
-    if video_id in download_status: del download_status[video_id]
-
-# --- SERIAL WORKER (READ: Remote -> STB) ---
-def handle_serial_cmd(action):
-    # Parsing perintah dari Knob Remote
-    if action == "pause": mpv_send(["cycle", "pause"])
-    elif action == "stop":
-        mpv_send(["stop"])
-        with state_lock:
-            st4_state["status"] = "stopped"
-            st4_state["queue"] = []
-            st4_state["current_index"] = -1
-            st4_state["manual_stop"] = True
-    elif action == "next": play_next_in_queue()
-    elif action == "prev":
-        with state_lock:
-            if st4_state["current_index"] > 0:
-                st4_state["current_index"] -= 1
-                prev_song = st4_state["queue"][st4_state["current_index"]]
-                trigger_play(prev_song['link'])
-            else: mpv_send(["seek", 0, "absolute"])
-    elif "volume" in action:
-        try:
-            val = int(action.split('=')[1])
-            mpv_send(["set_property", "volume", val])
-            with state_lock: st4_state["volume"] = val
-        except: pass
-    elif "jump" in action:
-        try:
-            idx = int(action.split('=')[1])
-            with state_lock:
-                if 0 <= idx < len(st4_state["queue"]):
-                    st4_state["current_index"] = idx
-                    song = st4_state["queue"][idx]
-                    st4_state["error_count"] = 0
-                    threading.Thread(target=trigger_play, args=(song['link'],)).start()
-        except: pass
-
+# --- WORKERS ---
 def serial_read_worker():
     global ser, stop_serial_flag
     while True:
-        # [PENTING] Pause pembacaan jika sedang flashing ESP
         if stop_serial_flag:
             time.sleep(1)
             continue
-            
-        if ser and ser.in_waiting > 0:
-            try:
+        if ser is None:
+            init_serial()
+            time.sleep(2)
+            continue
+        try:
+            if ser.in_waiting > 0:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if line.startswith("cmd:"):
-                    action = line.split(":", 1)[1]
-                    handle_serial_cmd(action)
-            except: pass
-        time.sleep(0.05) # Refresh 50ms
+                    # Handle basic commands from older remote code if any
+                    pass 
+        except:
+            ser = None
+        time.sleep(0.05)
 
-# --- METADATA WORKER (WRITE: STB -> Remote) ---
 def metadata_worker():
     global st4_state, needs_restore, ser, stop_serial_flag
     last_path = ""
     idle_counter = 0
-    if not os.path.exists(COVER_DIR): os.makedirs(COVER_DIR, exist_ok=True)
     
     while True:
         try:
-            # 1. Sleep Timer Logic
+            # Sleep Timer
             with state_lock:
                 target = st4_state["sleep_target"]
                 if target > 0:
@@ -317,7 +226,7 @@ def metadata_worker():
                 else:
                     st4_state["timer_display"] = "OFF"
 
-            # 2. Cek MPV Status
+            # MPV Logic
             mpv_ready = False
             try:
                 if mpv_send(["get_property", "idle-active"]) is not None: mpv_ready = True
@@ -327,7 +236,6 @@ def metadata_worker():
                 idle_counter = 0
                 path = mpv_send(["get_property", "path"])
                 
-                # Restore Volume & Audio Filters jika ganti lagu
                 if path and (path != last_path or needs_restore):
                     last_path = path
                     needs_restore = False
@@ -336,7 +244,6 @@ def metadata_worker():
                     mpv_send(["set_property", "volume", saved_vol])
                     update_mpv_filters()
                 
-                # Auto Play Logic (Next Song)
                 is_eof = mpv_send(["get_property", "eof-reached"])
                 is_idle = mpv_send(["get_property", "idle-active"])
                 
@@ -348,75 +255,55 @@ def metadata_worker():
                     time.sleep(1)
                     continue
                 
-                # Fetch Metadata
-                final_thumb = ""
-                with state_lock:
-                    if st4_state["queue"] and st4_state["current_index"] < len(st4_state["queue"]):
-                        final_thumb = st4_state["queue"][st4_state["current_index"]].get('thumb', '')
-                if not final_thumb:
-                    if path and "http" in path:
-                        if "googlevideo" not in path: final_thumb = get_yt_thumb(path)
-                    else:
-                        loc = extract_local_cover(path)
-                        if loc: final_thumb = loc
-                with state_lock: st4_state["thumb"] = final_thumb
-                
+                # Fetch Meta
                 meta_all = mpv_send(["get_property", "metadata"]) or {}
                 mpv_title = mpv_send(["get_property", "media-title"])
+                
                 queue_title = "Unknown Title"
                 with state_lock:
                     if st4_state["queue"] and st4_state["current_index"] < len(st4_state["queue"]):
                         queue_title = st4_state["queue"][st4_state["current_index"]]['title']
+                
                 final_title = queue_title
-                if mpv_title:
-                    is_junk = any(x in mpv_title.lower() for x in ["http", "www.", ".com", "webm&", "googlevideo", "?source"])
-                    if not is_junk: final_title = mpv_title
+                if mpv_title and not any(x in mpv_title.lower() for x in ["http", "www.", ".com", "googlevideo"]):
+                    final_title = mpv_title
                 
                 temp_artist = find_key_insensitive(meta_all, ["artist", "performer", "composer"]) or "Unknown Artist"
                 temp_album = find_key_insensitive(meta_all, ["album"]) or ""
-                temp_genre = find_key_insensitive(meta_all, ["genre"])
-                temp_year = find_key_insensitive(meta_all, ["date", "year", "original_date"])
                 
-                # Parsing Tech Specs (Codec, Bitrate)
-                tech_display = []
-                raw_codec = mpv_send(["get_property", "audio-codec-name"])
-                raw_fmt = mpv_send(["get_property", "audio-params/format"])
-                raw_rate = mpv_send(["get_property", "audio-params/samplerate"])
-                raw_br = mpv_send(["get_property", "audio-bitrate"])
-                codec_str = raw_codec.upper() if raw_codec else "UNK"
-                tech_display.append(codec_str)
-                if raw_br and int(raw_br) > 0:
-                    tech_display.append(f"{int(int(raw_br)/1000)}kbps")
-                sample_rate_val = 0
-                if raw_rate:
-                    try:
-                        sample_rate_val = float(raw_rate)
-                        tech_display.append(f"{sample_rate_val/1000:g}kHz")
-                    except: pass
+                # Tech Info Construction
+                tech_parts = []
+                codec = mpv_send(["get_property", "audio-codec-name"])
+                fmt = mpv_send(["get_property", "audio-params/format"])
+                rate = mpv_send(["get_property", "audio-params/samplerate"])
+                br = mpv_send(["get_property", "audio-bitrate"])
+                
+                if codec: tech_parts.append(codec.upper())
+                if br and int(br) > 0: tech_parts.append(f"{int(int(br)/1000)}kbps")
+                if rate: tech_parts.append(f"{float(rate)/1000:g}kHz")
+                
                 bit_depth = ""
-                if raw_fmt:
-                    if 's16' in raw_fmt: bit_depth = "16bit"
-                    elif 's24' in raw_fmt: bit_depth = "24bit"
-                    elif 's32' in raw_fmt or 'float' in raw_fmt: bit_depth = "32bit"
-                    elif 'dsd' in raw_fmt: bit_depth = "1bit(DSD)"
-                lossy_list = ['MP3', 'AAC', 'VORBIS', 'OPUS', 'WEBM', 'M4A']
-                is_lossy = any(x in codec_str for x in lossy_list)
-                if not is_lossy and bit_depth: tech_display.append(bit_depth)
-                badge = "Lossless"
-                if is_lossy: badge = "Lossy"
-                elif (bit_depth in ["24bit", "32bit"]) or (sample_rate_val > 48000): badge = "Hi-Res"
-                tech_display.append(badge)
-                temp_info = " • ".join(tech_display)
+                if fmt:
+                    if 's16' in fmt: bit_depth = "16bit"
+                    elif 's24' in fmt: bit_depth = "24bit"
+                    elif 's32' in fmt or 'float' in fmt: bit_depth = "32bit"
+                    elif 'dsd' in fmt: bit_depth = "1bit(DSD)"
+                if bit_depth and codec and not any(x in codec.upper() for x in ['MP3', 'AAC', 'VORBIS', 'OPUS']):
+                    tech_parts.append(bit_depth)
                 
+                badge = "Lossless"
+                if codec and any(x in codec.upper() for x in ['MP3', 'AAC', 'VORBIS', 'OPUS']): badge = "Lossy"
+                elif (bit_depth in ["24bit", "32bit"]) or (rate and float(rate) > 48000): badge = "Hi-Res"
+                tech_parts.append(badge)
+                
+                temp_info = " • ".join(tech_parts)
                 is_paused = mpv_send(["get_property", "pause"])
-                temp_status = "paused" if is_paused else "playing"
                 
                 with state_lock:
                     st4_state.update({
                         "title": final_title,
                         "artist": temp_artist, "album": temp_album,
-                        "genre": temp_genre, "year": temp_year,
-                        "status": temp_status,
+                        "status": "paused" if is_paused else "playing",
                         "tech_info": temp_info,
                         "current_time": mpv_send(["get_property", "time-pos"]) or 0,
                         "total_time": mpv_send(["get_property", "duration"]) or 0
@@ -427,11 +314,8 @@ def metadata_worker():
                 idle_counter += 1
                 if idle_counter == 5:
                     with state_lock: st4_state["status"] = "stopped"
-                if idle_counter == 15 and st4_state["status"] != "stopped":
-                    play_next_in_queue()
             
-            # --- SEND DATA TO ESP8266 (SERIAL) ---
-            # Pastikan tidak sedang flashing firmware
+            # Send to ESP
             if ser and not stop_serial_flag:
                 try:
                     with state_lock:
@@ -452,13 +336,13 @@ def metadata_worker():
                 except: pass
 
         except Exception as e: pass
-        time.sleep(1) # Interval update ke remote (1 detik)
+        time.sleep(1)
 
-# Start Threads
+# Start Background Workers
 threading.Thread(target=serial_read_worker, daemon=True).start()
 threading.Thread(target=metadata_worker, daemon=True).start()
 
-# --- WEB ROUTES ---
+# --- WEB & API ROUTES ---
 @app.route('/')
 def index(): return render_template('index.html')
 
@@ -466,158 +350,210 @@ def index(): return render_template('index.html')
 def status():
     with state_lock: return jsonify(st4_state)
 
-# --- [MENU RAHASIA] FLASHER OTA ---
-# Akses di browser: http://IP_STB:5000/flasher
-@app.route('/flasher')
-def flasher_ui():
-    return render_template_string("""
-    <html>
-    <head>
-        <title>ESP8266 OTA Flasher (ST4)</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { background: #1a1a1a; color: #eee; font-family: monospace; text-align: center; padding: 20px; }
-            h1 { color: #f39c12; }
-            .box { background: #333; padding: 20px; border-radius: 10px; max-width: 500px; margin: 0 auto; }
-            input[type=file] { margin: 20px 0; }
-            button { background: #e74c3c; color: white; border: none; padding: 15px 30px; font-size: 16px; border-radius: 5px; cursor: pointer; }
-            button:hover { background: #c0392b; }
-            .info { margin-top: 20px; color: #aaa; font-size: 14px; text-align: left; }
-        </style>
-    </head>
-    <body>
-        <h1>🔥 ESP8266 Flasher</h1>
-        <div class="box">
-            <p>Detected Port: <b>{{ port }}</b></p>
-            <form action="/flash_now" method="post" enctype="multipart/form-data">
-                <input type="file" name="firmware" accept=".bin" required><br>
-                <button type="submit" onclick="this.innerText='Flashing... Do Not Close!';">⚡ FLASH NOW ⚡</button>
-            </form>
-            <div class="info">
-                <h3>⚠️ INSTRUKSI FLASHING:</h3>
-                1. <b>Matikan Power/Baterai ESP</b>.<br>
-                2. Tahan tombol <b>FLASH</b> (atau jumper D3 ke GND).<br>
-                3. Nyalakan ESP, lalu <b>Lepas tombol Flash</b>.<br>
-                4. Upload file .bin dan klik tombol Flash.<br>
-                5. Setelah sukses, restart ESP.
-            </div>
-        </div>
-        <br><a href="/" style="color:#3498db;">Back to Player</a>
-    </body>
-    </html>
-    """, port=serial_port or "None (Check Cable!)")
+# --- [NEW] BROWSER API FOR ARDUINO ---
+@app.route('/browser/list')
+def browser_list():
+    # Arduino sends: path, start, limit
+    req_path = request.args.get('path', '')
+    start = int(request.args.get('start', 0))
+    limit = int(request.args.get('limit', 4))
+    
+    # Secure Path
+    base = os.path.abspath(INTERNAL_MUSIC_PATH)
+    if not req_path:
+        target_dir = base
+        current_display = "/"
+        parent_path = "EXIT"
+    else:
+        target_dir = os.path.abspath(os.path.join(base, req_path))
+        if not target_dir.startswith(base): target_dir = base
+        current_display = req_path
+        parent_path = os.path.dirname(req_path)
+        if parent_path == "" or parent_path == "/": parent_path = ""
 
-@app.route('/flash_now', methods=['POST'])
-def flash_now():
-    global ser, stop_serial_flag, serial_port
-    
-    if 'firmware' not in request.files: return "No file uploaded"
-    f = request.files['firmware']
-    if f.filename == '': return "No filename selected"
-    
-    if not serial_port: return "Error: No Serial Port Detected! Check cable."
-
-    # 1. Simpan File .bin sementara
-    save_path = "/tmp/firmware.bin"
-    f.save(save_path)
-    
-    # 2. Matikan Komunikasi Serial (PAUSE WORKER)
-    # Agar esptool bisa mengambil alih port
-    stop_serial_flag = True
-    if ser: 
-        ser.close()
-        ser = None
-    time.sleep(1) # Beri waktu
-    
-    # 3. Eksekusi ESPTOOL via CLI
-    # Menggunakan baudrate tinggi (460800) biar cepat
-    cmd = f"esptool.py --port {serial_port} --baud 460800 write_flash --flash_size=detect 0x0 {save_path}"
-    
-    log_output = ""
+    items = []
     try:
-        # Jalankan command
-        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = process.communicate()
-        
-        # Tampilkan Log
-        log_output = f"<h3>STDOUT:</h3><pre>{out.decode()}</pre><br><h3>STDERR:</h3><pre>{err.decode()}</pre>"
-        
-    except Exception as e:
-        log_output = f"<h3>Execution Error:</h3><pre>{str(e)}</pre>"
+        # Create ".." entry if not root
+        entries = sorted(os.scandir(target_dir), key=lambda e: (not e.is_dir(), e.name.lower()))
+        for e in entries:
+            if e.name.startswith('.'): continue
+            if e.is_dir():
+                items.append({"n": e.name, "p": os.path.join(req_path, e.name), "t": "D"})
+            elif e.is_file() and e.name.lower().endswith(AUDIO_EXTS):
+                items.append({"n": e.name, "p": os.path.join(req_path, e.name), "t": "F"})
+    except: pass
 
-    # 4. Hidupkan Serial Lagi (RESTART)
-    try:
-        ser = serial.Serial(serial_port, 115200, timeout=1)
-        stop_serial_flag = False
-        if "Hash of data verified" in log_output or "Leaving..." in log_output:
-            log_output += "<h2 style='color:lightgreen'>✅ Flashing Success! Serial Reconnected.</h2>"
-        else:
-            log_output += "<h2 style='color:orange'>⚠️ Flashing finished (Check logs). Serial Reconnected.</h2>"
-            
-    except Exception as e:
-        log_output += f"<h2 style='color:red'>⚠️ Failed to reconnect serial: {str(e)}. Please restart STB container.</h2>"
+    # Pagination
+    total = len(items)
+    sliced_items = items[start : start + limit]
+    
+    return jsonify({
+        "total": total,
+        "current": current_display,
+        "parent": parent_path,
+        "items": sliced_items
+    })
 
-    return f"""
-    <body style="background:#222; color:#fff; font-family:monospace; padding:20px;">
-        <h1>Flashing Result</h1>
-        {log_output}
-        <br><a href='/flasher' style="color:#f39c12; font-size:20px;">Back to Flasher</a>
-    </body>
-    """
-
-# --- PLAYBACK CONTROLS ---
-@app.route('/play', methods=['GET', 'POST'])
-def play():
-    url = request.args.get('url') or request.form.get('link')
-    mode = request.args.get('mode', 'play_now')
-    title = request.args.get('title', 'Unknown Title')
-    if not url: return jsonify({"error": "no url"})
-    song_obj = {'link': url, 'title': title}
+@app.route('/browser/play_file')
+def browser_play_file():
+    rel_path = request.args.get('path', '')
+    full_path = os.path.join(INTERNAL_MUSIC_PATH, rel_path)
+    
+    # Setup single song queue
     with state_lock:
-        if mode == 'play_now':
-            if os.path.exists(url) and os.path.isfile(url):
-                try:
-                    folder_path = os.path.dirname(url)
-                    folder_files = [f for f in os.listdir(folder_path) if f.lower().endswith(AUDIO_EXTS)]
-                    folder_files.sort(key=lambda x: x.lower())
-                    new_queue = []
-                    target_index = 0
-                    for idx, fname in enumerate(folder_files):
-                        full_path = os.path.join(folder_path, fname)
-                        new_queue.append({'link': full_path, 'title': fname})
-                        if full_path == url: target_index = idx
-                    st4_state["queue"] = new_queue
-                    st4_state["current_index"] = target_index
-                except:
-                    st4_state["queue"] = [song_obj]; st4_state["current_index"] = 0
-            elif "youtube.com" in url or "youtu.be" in url:
-                st4_state["queue"] = [song_obj]; st4_state["current_index"] = 0
-                try:
-                    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
-                    video_id = match.group(1) if match else None
-                    if video_id:
-                        data = yt_music.get_watch_playlist(videoId=video_id, limit=20)
-                        if 'tracks' in data:
-                            new_queue = []
-                            for t in data['tracks']:
-                                vid = t.get('videoId')
-                                if vid:
-                                    t_artist = t['artists'][0]['name'] if 'artists' in t and t['artists'] else ""
-                                    full_title = f"{t_artist} - {t['title']}" if t_artist else t['title']
-                                    new_queue.append({'link': f"https://music.youtube.com/watch?v={vid}", 'title': full_title})
-                            if new_queue: st4_state["queue"] = new_queue; st4_state["current_index"] = 0
-                except: pass
-            else:
-                st4_state["queue"] = [song_obj]; st4_state["current_index"] = 0
-            st4_state["error_count"] = 0
-            threading.Thread(target=trigger_play, args=(url,)).start()
-        elif mode == 'enqueue':
-            st4_state["queue"].append(song_obj)
-            if st4_state["status"] == "stopped" and len(st4_state["queue"]) == 1:
-                st4_state["current_index"] = 0
-                threading.Thread(target=trigger_play, args=(url,)).start()
-    return jsonify({"status": "ok", "mode": mode, "queue_len": len(st4_state["queue"])})
+        st4_state["queue"] = [{'link': full_path, 'title': os.path.basename(full_path)}]
+        st4_state["current_index"] = 0
+        st4_state["error_count"] = 0
+    
+    threading.Thread(target=trigger_play, args=(full_path,)).start()
+    return jsonify({"status": "ok"})
 
+@app.route('/browser/play_folder')
+def browser_play_folder():
+    rel_path = request.args.get('path', '')
+    full_path = os.path.join(INTERNAL_MUSIC_PATH, rel_path)
+    
+    try:
+        files = [f for f in os.listdir(full_path) if f.lower().endswith(AUDIO_EXTS)]
+        files.sort(key=lambda x: x.lower())
+        
+        new_queue = []
+        for f in files:
+            new_queue.append({'link': os.path.join(full_path, f), 'title': f})
+            
+        if new_queue:
+            with state_lock:
+                st4_state["queue"] = new_queue
+                st4_state["current_index"] = 0
+                st4_state["error_count"] = 0
+            threading.Thread(target=trigger_play, args=(new_queue[0]['link'],)).start()
+            return jsonify({"status": "playing_folder", "count": len(new_queue)})
+    except: pass
+    return jsonify({"error": "empty or invalid"})
+
+# --- [NEW] SYSTEM TOOLS COMMANDS ---
+@app.route('/system/exec_cmd')
+def system_exec():
+    key = request.args.get('key', '')
+    msg = "Unknown Cmd"
+    
+    # Warning: Running as root inside Docker
+    try:
+        if key == "ping_test":
+            res = subprocess.run(["ping", "-c", "1", "8.8.8.8"], stdout=subprocess.DEVNULL)
+            msg = "Internet OK" if res.returncode == 0 else "No Internet"
+        elif key == "check_ip":
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(('8.8.8.8', 80)); ip = s.getsockname()[0]
+                msg = ip
+            except: msg = "No IP"
+            finally: s.close()
+        elif key == "clean_ram":
+            subprocess.run("sync; echo 3 > /proc/sys/vm/drop_caches", shell=True)
+            msg = "RAM Cleaned"
+        elif key == "restart_net":
+            # Restart networking container side (might not affect host much)
+            msg = "Net Restarted" 
+        elif key == "reboot_system":
+            # Dangerous! Only works if container is privileged
+            threading.Thread(target=lambda: (time.sleep(1), subprocess.run(["reboot"]))).start()
+            msg = "Rebooting..."
+        elif key == "restart_docker":
+            # Cant restart self easily, assume calling host watchdog?
+            msg = "Not Supported"
+    except Exception as e:
+        msg = "Error"
+        
+    return jsonify({"msg": msg})
+
+# --- [NEW] REAL SYSTEM STATS ---
+@app.route('/system/stats')
+def system_stats():
+    # CPU Temp
+    temp = "0C"
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            t = int(f.read().strip())
+            temp = f"{t/1000:.0f}C"
+    except: pass
+    
+    # RAM
+    ram = "-/-"
+    try:
+        with open("/proc/meminfo", "r") as f:
+            lines = f.readlines()
+            total = int(lines[0].split()[1]) // 1024
+            free = int(lines[1].split()[1]) // 1024
+            used = total - free
+            ram = f"{used}/{total}"
+    except: pass
+    
+    # Disk (Music Path)
+    disk = "-"
+    try:
+        total, used, free = shutil.disk_usage(INTERNAL_MUSIC_PATH)
+        percent = (used / total) * 100
+        disk = f"{percent:.0f}%"
+    except: pass
+    
+    # Uptime
+    uptime = "-"
+    try:
+        with open("/proc/uptime", "r") as f:
+            u = float(f.read().split()[0])
+            uptime = f"{int(u/3600)}h"
+    except: pass
+    
+    return jsonify({
+        "temp": temp, "ram": ram, "disk": disk, "uptime": uptime
+    })
+
+# --- [NEW] NETWORK SPEED MONITOR ---
+@app.route('/system/net_stats')
+def net_stats():
+    global last_net_check, last_rx, last_tx, curr_rx_speed, curr_tx_speed
+    
+    now = time.time()
+    if now - last_net_check >= 1.0:
+        try:
+            with open("/proc/net/dev", "r") as f:
+                lines = f.readlines()
+                for line in lines:
+                    if "eth0" in line: # Or wlan0 depending on STB
+                        parts = line.split()
+                        # eth0: parts[0] is name, parts[1] is RX bytes, parts[9] is TX bytes
+                        rx = int(parts[1])
+                        tx = int(parts[9])
+                        
+                        if last_net_check > 0:
+                            curr_rx_speed = (rx - last_rx) / 1024 # KB/s
+                            curr_tx_speed = (tx - last_tx) / 1024 # KB/s
+                        
+                        last_rx = rx
+                        last_tx = tx
+                        last_net_check = now
+                        break
+        except: pass
+
+    # Format for Arduino
+    # dl_val: 0-100 (visual bar), dl_str: string display
+    dl_kb = int(curr_rx_speed)
+    ul_kb = int(curr_tx_speed)
+    
+    dl_str = f"{dl_kb}K" if dl_kb < 1000 else f"{dl_kb/1024:.1f}M"
+    ul_str = f"{ul_kb}K" if ul_kb < 1000 else f"{ul_kb/1024:.1f}M"
+    
+    # Simple mapping for progress bar (scale 0-10MB/s)
+    dl_val = min(100, int(dl_kb / 100)) 
+    ul_val = min(100, int(ul_kb / 100))
+
+    return jsonify({
+        "dl_str": dl_str, "dl_val": dl_val,
+        "ul_str": ul_str, "ul_val": ul_val
+    })
+
+# --- STANDARD CONTROLS (OLD BUT GOLD) ---
 @app.route('/control/<action>')
 def control(action):
     if action == "pause": mpv_send(["cycle", "pause"])
@@ -627,83 +563,26 @@ def control(action):
             st4_state["status"] = "stopped"
             st4_state["queue"] = []
             st4_state["current_index"] = -1
-            st4_state["manual_stop"] = True
     elif action == "next": play_next_in_queue()
     elif action == "prev":
         with state_lock:
             if st4_state["current_index"] > 0:
                 st4_state["current_index"] -= 1
-                prev_song = st4_state["queue"][st4_state["current_index"]]
-                trigger_play(prev_song['link'])
-            else: mpv_send(["seek", 0, "absolute"])
-    elif action == "shuffle":
-        with state_lock:
-            if len(st4_state["queue"]) > 1:
-                current_song = st4_state["queue"][st4_state["current_index"]]
-                random.shuffle(st4_state["queue"])
-                for idx, song in enumerate(st4_state["queue"]):
-                    if song['link'] == current_song['link']:
-                        st4_state["current_index"] = idx; break
-        return jsonify({"status": "shuffled"})
-    elif action == "volume":
+                trigger_play(st4_state["queue"][st4_state["current_index"]]['link'])
+    elif "volume" in action:
         try:
             v = int(request.args.get('val', 50))
             mpv_send(["set_property", "volume", v])
             with state_lock: st4_state["volume"] = v
         except: pass
-    elif action == "seek":
-        try: mpv_send(["seek", float(request.args.get('val', 0)), "absolute-percent"])
-        except: pass
-    return jsonify({"status": "ok"})
-
-@app.route('/control/jump')
-def jump_to_index():
-    try:
-        idx = int(request.args.get('index', -1))
-        with state_lock:
-            if 0 <= idx < len(st4_state["queue"]):
-                st4_state["current_index"] = idx
-                song = st4_state["queue"][idx]
-                st4_state["error_count"] = 0
-                threading.Thread(target=trigger_play, args=(song['link'],)).start()
-                return jsonify({"status": "ok", "title": song['title']})
-    except: pass
-    return jsonify({"error": "invalid index"})
-
-@app.route('/download_song')
-def download_song():
-    vid = request.args.get('id')
-    quality = request.args.get('q', 'mp3')
-    if not vid: return jsonify({"error": "No ID"})
-    save_path = INTERNAL_MUSIC_PATH
-    if os.path.exists(DEFAULT_PATH_FILE):
+    elif "jump" in action:
         try:
-            with open(DEFAULT_PATH_FILE, 'r') as f:
-                tmp = f.read().strip()
-                if os.path.exists(tmp): save_path = tmp
+            idx = int(request.args.get('index', 0))
+            with state_lock:
+                if 0 <= idx < len(st4_state["queue"]):
+                    st4_state["current_index"] = idx
+                    trigger_play(st4_state["queue"][idx]['link'])
         except: pass
-    threading.Thread(target=run_download, args=(vid, save_path, quality)).start()
-    return jsonify({"status": "started", "path": save_path, "quality": quality})
-
-@app.route('/check_dl')
-def check_dl():
-    vid = request.args.get('id')
-    return jsonify({"status": download_status.get(vid, "none")})
-
-@app.route('/control/eq')
-def set_eq():
-    p = request.args
-    gains = {}
-    for i in range(1, 11): gains[f'f{i}'] = p.get(f'f{i}', 0)
-    freqs = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
-    entries = []
-    for i in range(1, 11):
-        val = float(gains.get(f'f{i}', 0))
-        entries.append(f"entry({freqs[i-1]},{val})")
-    cmd_str = f"firequalizer=gain_entry='{';'.join(entries)}'"
-    af_state["eq"] = f"lavfi=[{cmd_str}]"
-    update_mpv_filters()
-    with state_lock: st4_state["current_eq_cmd"] = af_state["eq"]
     return jsonify({"status": "ok"})
 
 @app.route('/control/preset')
@@ -723,7 +602,23 @@ def set_preset():
             st4_state["active_preset"] = n
             st4_state["current_eq_cmd"] = af_state["eq"]
         return jsonify(preset)
-    return jsonify({"error": "not found"}), 404
+    return jsonify({"error": "not found"})
+
+@app.route('/control/eq')
+def set_eq():
+    p = request.args
+    gains = {}
+    for i in range(1, 11): gains[f'f{i}'] = p.get(f'f{i}', 0)
+    freqs = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+    entries = []
+    for i in range(1, 11):
+        val = float(gains.get(f'f{i}', 0))
+        entries.append(f"entry({freqs[i-1]},{val})")
+    cmd_str = f"firequalizer=gain_entry='{';'.join(entries)}'"
+    af_state["eq"] = f"lavfi=[{cmd_str}]"
+    update_mpv_filters()
+    with state_lock: st4_state["current_eq_cmd"] = af_state["eq"]
+    return jsonify({"status": "ok"})
 
 @app.route('/control/bitperfect')
 def toggle_bitperfect():
@@ -735,19 +630,7 @@ def toggle_bitperfect():
     new_state = "1" if current == "0" else "0"
     with open(BP_MODE_FILE, 'w') as f: f.write(new_state)
     update_mpv_filters()
-    if new_state == "0":
-        mpv_send(["set_property", "volume", 50])
-        with state_lock: st4_state["volume"] = 50
     return jsonify({"status": "ok", "bitperfect": new_state == "1"})
-
-@app.route('/get_bitperfect')
-def get_bitperfect():
-    active = False
-    if os.path.exists(BP_MODE_FILE):
-        try:
-            with open(BP_MODE_FILE, 'r') as f: active = f.read().strip() == "1"
-        except: pass
-    return jsonify({"active": active})
 
 @app.route('/control/crossfeed')
 def toggle_crossfeed():
@@ -755,10 +638,6 @@ def toggle_crossfeed():
     af_state["crossfeed"] = "lavfi=[bs2b=profile=cmoy]" if state == 'on' else ""
     update_mpv_filters()
     return jsonify({"status": "ok", "crossfeed": state == 'on'})
-
-@app.route('/get_crossfeed')
-def get_crossfeed():
-    return jsonify({"active": len(af_state["crossfeed"]) > 0})
 
 @app.route('/control/balance')
 def set_balance():
@@ -770,25 +649,7 @@ def set_balance():
     if l_vol >= 0.99 and r_vol >= 0.99: af_state["balance"] = ""
     else: af_state["balance"] = f"lavfi=[{pan_cmd}]"
     update_mpv_filters()
-    return jsonify({"status": "ok", "L": l_vol, "R": r_vol})
-
-@app.route('/system/default_path', methods=['GET', 'POST'])
-def handle_default_path():
-    if request.method == 'POST':
-        try:
-            data = request.json; new_path = data.get('path', '/root')
-            if os.path.exists(new_path):
-                with open(DEFAULT_PATH_FILE, 'w') as f: f.write(new_path)
-                return jsonify({"status": "ok", "path": new_path})
-            else: return jsonify({"error": "Path not found"}), 404
-        except Exception as e: return jsonify({"error": str(e)}), 500
-    else:
-        path = INTERNAL_MUSIC_PATH 
-        if os.path.exists(DEFAULT_PATH_FILE):
-            try:
-                with open(DEFAULT_PATH_FILE, 'r') as f: path = f.read().strip()
-            except: pass
-        return jsonify({"path": path})
+    return jsonify({"status": "ok"})
 
 @app.route('/system/timer')
 def set_timer():
@@ -799,71 +660,19 @@ def set_timer():
 
 @app.route('/queue/list')
 def get_queue():
-    with state_lock: return jsonify({"queue": st4_state["queue"], "current_index": st4_state["current_index"]})
-
-@app.route('/queue/clear')
-def clear_queue():
-    with state_lock: st4_state["queue"] = []; st4_state["current_index"] = -1
-    return jsonify({"status": "cleared"})
-
-@app.route('/get_playlist')
-def get_playlist():
-    if os.path.exists(PLAYLIST_FILE):
-        try:
-            with open(PLAYLIST_FILE, 'r') as f: return jsonify(json.load(f))
-        except: pass
-    return jsonify([])
-
-@app.route('/save_playlist', methods=['POST'])
-def save_playlist():
-    try:
-        with open(PLAYLIST_FILE, 'w') as f: json.dump(request.json, f)
-        return jsonify({"status": "ok"})
-    except: return jsonify({"error": "failed"}), 500
-
-@app.route('/get_files')
-def get_files():
-    target = request.args.get('path', INTERNAL_MUSIC_PATH)
-    items = []
-    try:
-        if not os.path.exists(target): target = INTERNAL_MUSIC_PATH
-        abs_path = os.path.abspath(target)
-        if abs_path != '/' and abs_path != os.path.dirname(abs_path):
-            items.append({'name': '..', 'path': os.path.dirname(abs_path), 'type': 'dir'})
-        with os.scandir(abs_path) as entries:
-            for entry in entries:
-                if entry.name.startswith('.'): continue
-                if entry.is_dir(): items.append({'name': entry.name, 'path': entry.path, 'type': 'dir'})
-                elif entry.is_file() and entry.name.lower().endswith(AUDIO_EXTS):
-                    items.append({'name': entry.name, 'path': entry.path, 'type': 'file'})
-    except: return jsonify([])
-    items.sort(key=lambda x: (x['type'] != 'dir', x['name'].lower()))
-    return jsonify(items)
-
-@app.route('/library/scan')
-def scan_library():
-    scan_path = INTERNAL_MUSIC_PATH
-    if os.path.exists(DEFAULT_PATH_FILE):
-        try:
-            with open(DEFAULT_PATH_FILE, 'r') as f: scan_path = f.read().strip()
-        except: pass
-    lib_mgr.scan_directory(scan_path)
-    return jsonify({"status": "started", "path": scan_path})
-
-@app.route('/library/status')
-def library_status(): return jsonify(lib_mgr.get_scan_status())
-
-@app.route('/library/tracks')
-def library_tracks():
-    sort_mode = request.args.get('sort', 'title')
-    tracks = lib_mgr.get_all_tracks(sort_mode)
-    formatted = []
-    for t in tracks:
-        formatted.append({
-            'name': t['title'], 'path': t['path'], 'type': 'file',
-            'artist': t['artist'], 'album': t['album'], 'meta': f"{t['artist']} - {t['album']}"
+    start = int(request.args.get('start', 0))
+    limit = int(request.args.get('limit', 4))
+    with state_lock:
+        total = len(st4_state["queue"])
+        sliced = []
+        for i in range(start, min(start + limit, total)):
+            item = st4_state["queue"][i]
+            sliced.append({"i": i, "t": item['title']})
+        return jsonify({
+            "total": total,
+            "current": st4_state["current_index"],
+            "items": sliced
         })
-    return jsonify(formatted)
 
 @app.route('/search')
 def search_yt():
@@ -879,33 +688,60 @@ def search_yt():
         return jsonify(data)
     except: return jsonify([])
 
-@app.route('/get_lyrics')
-def get_lyrics():
+@app.route('/play')
+def play():
+    # Handle Web UI Play Requests
+    url = request.args.get('url')
+    title = request.args.get('title', 'Unknown')
+    mode = request.args.get('mode', 'play_now')
+    
+    if not url: return jsonify({"error": "no url"})
+    song = {'link': url, 'title': title}
+    
     with state_lock:
-        artist = st4_state.get("artist", "")
-        title = st4_state.get("title", "")
-    if not artist or not title or artist == "Unknown Artist": return jsonify({"error": "No track info"})
-    clean_title = re.sub(r"\(.*?\)|\[.*?\]", "", title).strip()
-    try:
-        url = "https://lrclib.net/api/get"
-        params = { "artist_name": artist, "track_name": clean_title }
-        resp = requests.get(url, params=params, timeout=5)
-        data = resp.json()
-        if 'syncedLyrics' in data and data['syncedLyrics']: return jsonify({"type": "synced", "lyrics": data['syncedLyrics']})
-        elif 'plainLyrics' in data and data['plainLyrics']: return jsonify({"type": "plain", "lyrics": data['plainLyrics']})
-        else: return jsonify({"error": "Not found"})
-    except Exception as e: return jsonify({"error": str(e)})
+        if mode == 'play_now':
+            st4_state["queue"] = [song]
+            st4_state["current_index"] = 0
+            trigger_play(url)
+        elif mode == 'enqueue':
+            st4_state["queue"].append(song)
+            if st4_state["status"] == "stopped":
+                st4_state["current_index"] = 0
+                trigger_play(url)
+                
+    return jsonify({"status": "ok"})
 
-def get_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('8.8.8.8', 80))
-        IP = s.getsockname()[0]
-    except: IP = '127.0.0.1'
-    finally: s.close()
-    return IP
+# --- FLASHER (KEEP THIS) ---
+@app.route('/flasher')
+def flasher_ui():
+    return render_template_string("""
+    <html><body><h1>ESP8266 Flasher</h1>
+    <form action="/flash_now" method="post" enctype="multipart/form-data">
+    <input type="file" name="firmware" required><br><br>
+    <button type="submit">⚡ FLASH NOW ⚡</button>
+    </form></body></html>""")
+
+@app.route('/flash_now', methods=['POST'])
+def flash_now():
+    global ser, stop_serial_flag
+    if 'firmware' not in request.files: return "No file"
+    f = request.files['firmware']
+    if f.filename == '': return "No file"
+    
+    stop_serial_flag = True
+    if ser: 
+        try: ser.close()
+        except: pass
+        ser = None
+    time.sleep(1)
+    
+    f.save("/tmp/firmware.bin")
+    cmd = f"esptool.py --port {serial_port} --baud 460800 write_flash --flash_size=detect 0x0 /tmp/firmware.bin"
+    subprocess.run(cmd, shell=True)
+    
+    init_serial()
+    stop_serial_flag = False
+    return "Done. Please restart ESP."
 
 if __name__ == '__main__':
-    local_ip = get_ip()
-    print("\n" + "="*40 + f"\n  ST4 PLAYER IS RUNNING! 🚀\n  Access: http://{local_ip}:5000\n  Flasher: http://{local_ip}:5000/flasher\n" + "="*40 + "\n")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

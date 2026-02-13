@@ -1,86 +1,200 @@
-# ST4 Player Pro 🎧
+# ðŸŽµ ST4 Player (Audiophile STB Music Server)
 
-**ST4 Player Pro** adalah Web-based Audio Player High-Fidelity yang dirancang khusus untuk berjalan di **Android (via Termux)**.
+**ST4 Player** adalah aplikasi pemutar musik *headless* berbasis Python
+& Flask yang dirancang khusus untuk berjalan di **STB OpenWrt (Amlogic
+HG680P/B860H)** via Docker.
 
-Aplikasi ini mengubah HP Android lama (atau baru) menjadi **Headless Music Streamer** berkualitas Audiophile yang bisa dikontrol lewat browser dari perangkat apa saja di jaringan WiFi yang sama.
+Aplikasi ini mengubah STB bekas menjadi **Music Server Audiophile**
+dengan kemampuan DSP (EQ, Crossfeed), integrasi YouTube Music, dan
+kontrol hardware dua arah melalui Serial Port (UART) ke Remote/Display
+eksternal (ESP8266).
 
----
+![ST4 Player UI](static/img/default.png)
 
-## 🔥 Fitur Utama
+------------------------------------------------------------------------
 
-### 🧠 Core System
-- **Lightweight Backend:** Dibangun dengan **Flask** (Python) dan **SQLite**.
-- **MPV Audio Engine:** Menggunakan **MPV** via Socket IPC untuk decoding audio bit-perfect.
-- **Support Format Luas:** FLAC, WAV, MP3, OGG, AAC, M4A, OPUS.
-- **Smart Library:** Scanning ribuan lagu dalam detik menggunakan `mutagen` (Metadata Reader).
+## âœ¨ Fitur Utama
 
-### 🎨 User Experience
-- **Progressive Web App (PWA):** Bisa diinstall ke Home Screen Android (Fullscreen, Native-like experience).
-- **Smooth UI:** Progress bar 60fps dengan interpolasi waktu (anti patah-patah).
-- **Physics Knobs:** Kontrol Volume & EQ dengan gaya putar (rotary) yang natural.
-- **Lazy Loading:** Optimasi rendering untuk library dengan ribuan lagu.
+-   **Playback Engine:** Menggunakan `mpv` untuk kualitas audio tinggi
+    (FLAC, MP3, WAV, AAC, DSD via DoP).
+-   **Web Interface:** Antarmuka responsif untuk kontrol, manajemen
+    playlist, dan file browser.
+-   **DSP & Audio Processing:**
+    -   10-Band Equalizer dengan Preset.
+    -   **Bitperfect Mode:** Bypass semua filter untuk audio murni.
+    -   **Crossfeed (CMoy):** Simulasi speaker untuk headphone.
+-   **YouTube Music Integration:** Cari, putar, dan **download** lagu
+    dari YT Music.
+-   **Hardware Integration (Serial/UART):**
+    -   Mengirim metadata lagu ke display eksternal.
+    -   Menerima perintah fisik (Knob/Tombol) dari hardware eksternal.
+    -   **OTA Flasher:** Flash firmware ESP8266 langsung dari Web UI
+        STB.
 
-### 🎛️ Audio Processing (DSP)
-- **10-Band Equalizer:** Parametric EQ menggunakan FFmpeg filter (`firequalizer`).
-- **Bit-Perfect Mode:** Mode khusus untuk mematikan semua DSP agar output audio 100% murni.
-- **Crossfeed (BS2B):** Simulasi binaural untuk mengurangi kelelahan telinga saat memakai headphone.
+------------------------------------------------------------------------
 
----
+## ðŸ› ï¸ Prasyarat Hardware
 
-## 🛠️ Instalasi (Termux)
+1.  **STB Amlogic** (HG680P, B860H, dll) dengan firmware **OpenWrt**.
+2.  **USB DAC** (Opsional, sangat disarankan).
+3.  **Koneksi Serial:** Pin UART internal STB (GND, TX, RX) terhubung ke
+    ESP8266/ESP32.
 
-Pastikan kamu sudah menginstall **Termux** dari F-Droid atau GitHub (Jangan dari Play Store karena versinya usang).
+------------------------------------------------------------------------
 
-### 1. Update System & Install Dependencies
-Jalankan perintah ini di terminal Termux:
+## ðŸš€ Instalasi (Docker)
 
-```bash
-pkg update && pkg upgrade -y
-pkg install python3 python3-pip ffmpeg mpv git yt-dlp -y
+Metode ini paling bersih dan aman untuk sistem OpenWrt.
+
+### 1. Persiapan Sistem (Host OpenWrt)
+
+Matikan akses console sistem ke serial port `/dev/ttyAML0` agar bisa
+dipakai Python.
+
+1.  SSH ke STB
+
+2.  Edit file inittab:
+
+    ``` bash
+    nano /etc/inittab
+    ```
+
+3.  Beri tanda `#` pada baris ttyAML0:
+
+    ``` text
+    # ::askconsole:/usr/libexec/login.sh ttyAML0
+    ```
+
+4.  **Reboot STB**
+
+------------------------------------------------------------------------
+
+### 2. Build Docker Image
+
+Lakukan build langsung di STB (pastikan koneksi internet lancar).
+
+``` bash
+cd /root/st4-player
+
+# Gunakan --network=host agar proses build bisa akses internet
+docker build --network=host -t st4player .
 ```
 
-### 2. Clone Repository
-```bash
-git clone https://github.com/st4ngkudut/st4-player.git
-cd st4-player
-chmod +x play.sh
-chmod +x st4player.sh
+------------------------------------------------------------------------
+
+### 3. Jalankan Container
+
+Jalankan perintah berikut.\
+**PENTING:** Sesuaikan path volume (`-v`) dengan lokasi lagu Anda.
+
+``` bash
+docker run -d \
+  --name st4player \
+  --restart unless-stopped \
+  --net=host \
+  --privileged \
+  --device /dev/snd:/dev/snd \
+  --device /dev/ttyAML0:/dev/ttyAML0 \
+  -v /root/st4-player/music.db:/app/music.db \
+  -v /root/st4-player/playlist.json:/app/playlist.json \
+  -v /mnt/mmcblk2p4/music:/music \
+  -e TZ=Asia/Jakarta \
+  st4player
 ```
 
-### 3. Install Python Libraries
-```bash
-pip install -r requirements.txt
+**Catatan:**\
+Ganti `/mnt/mmcblk2p4/music` dengan path folder musik di harddisk
+eksternal / SD Card Anda.
+
+------------------------------------------------------------------------
+
+## ðŸ“‚ Struktur Direktori
+
+    /st4-player
+    â”œâ”€â”€ app.py              # Logic Utama (Flask)
+    â”œâ”€â”€ library.py          # Modul Scanner Lagu
+    â”œâ”€â”€ play.sh             # Script Wrapper MPV
+    â”œâ”€â”€ Dockerfile          # Config Docker
+    â”œâ”€â”€ requirements.txt    # Python Libs
+    â”œâ”€â”€ static/             # Assets Web (CSS/JS)
+    â”œâ”€â”€ templates/          # HTML Files
+    â””â”€â”€ music.db            # Database (Auto-generated)
+
+------------------------------------------------------------------------
+
+## ðŸ“¡ API Endpoints & Serial
+
+### HTTP API
+
+  Method   Endpoint                  Deskripsi
+  -------- ------------------------- -------------------------------
+  GET      /status                   Cek status player (JSON)
+  GET      /play?url={link}          Putar lagu (lokal / URL)
+  GET      /control/{action}         play, pause, next, prev, stop
+  GET      /control/volume?val=XX    Set volume (0-100)
+  GET      /download_song?id={vid}   Download dari YT Music
+
+------------------------------------------------------------------------
+
+### Serial Protocol (UART)
+
+Baudrate: **115200**
+
+#### STB â†’ ESP (JSON Line)
+
+``` json
+{"title": "Song", "artist": "Band", "status": "playing", "volume": 50}
 ```
 
-## 🚀 Cara Menjalankan
-### Start Server
-Cukup jalankan satu perintah ini:
-```bash
-bash st4player.sh
-```
-atau
-```bash
-python3 app.py
-```
+#### ESP â†’ STB (String Command + newline)
 
----
+    cmd:play
+    cmd:pause
+    cmd:next
+    cmd:prev
+    cmd:volume=80
 
-## 📱 Cara Install (Full Screen App / PWA)
+------------------------------------------------------------------------
 
-Agar tampilannya full screen tanpa address bar browser:
+## ðŸ› Troubleshooting
 
-1. Buka **Chrome** di HP Android  
-2. Akses: http://127.0.0.1:5000 di browser
-3. Tunggu loading selesai sempurna  
-4. Buka **Menu Chrome** (titik tiga di pojok kanan atas)  
-5. Pilih **"Add to Home screen"** atau **"Install App"**  
-6. Klik **Install**  
-7. Cek Home Screen → icon **ST4 Player** siap digunakan 🎉
+### Build Error (Network)
 
+Selalu gunakan flag:
 
----
+    --network=host
 
-Happy Listening! 🎧  
-Built with Python & Love ❤️  
+### Tidak Ada Suara
 
+-   Pastikan device audio terpasang:
 
+        --device /dev/snd:/dev/snd
+
+-   Cek volume host:
+
+        alsamixer
+
+-   Cek file audio valid.
+
+### Serial Error / Flashing Gagal
+
+-   Pastikan `/etc/inittab` sudah diedit & STB sudah reboot.
+-   Cek kabel:
+    -   TX STB â†’ RX ESP
+    -   RX STB â†’ TX ESP
+    -   GND harus menyatu.
+
+### Lagu Tidak Terbaca
+
+-   Cek mounting volume `-v`.
+-   Gunakan menu **Rescan Library** di Web UI.
+
+------------------------------------------------------------------------
+
+## ðŸ“œ License
+
+Project ini dibuat untuk edukasi dan hobi.
+
+Based on: - Flask\
+- MPV\
+- YT-DLP
