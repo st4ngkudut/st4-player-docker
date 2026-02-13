@@ -1,8 +1,0 @@
-__pycache__/
-static/
-templates/
-*.pyc
-music.db
-state_bp_mode
-.env
-.gitignore
