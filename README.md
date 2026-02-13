@@ -1,4 +1,4 @@
-# ðŸŽµ ST4 Player (Audiophile STB Music Server)
+# ST4 Player (Audiophile STB Music Server)
 
 **ST4 Player** adalah aplikasi pemutar musik *headless* berbasis Python
 & Flask yang dirancang khusus untuk berjalan di **STB OpenWrt (Amlogic
@@ -13,7 +13,7 @@ eksternal (ESP8266).
 
 ------------------------------------------------------------------------
 
-## âœ¨ Fitur Utama
+## Fitur Utama
 
 -   **Playback Engine:** Menggunakan `mpv` untuk kualitas audio tinggi
     (FLAC, MP3, WAV, AAC, DSD via DoP).
@@ -33,7 +33,7 @@ eksternal (ESP8266).
 
 ------------------------------------------------------------------------
 
-## ðŸ› ï¸ Prasyarat Hardware
+## Prasyarat Hardware
 
 1.  **STB Amlogic** (HG680P, B860H, dll) dengan firmware **OpenWrt**.
 2.  **USB DAC** (Opsional, sangat disarankan).
@@ -42,7 +42,7 @@ eksternal (ESP8266).
 
 ------------------------------------------------------------------------
 
-## ðŸš€ Instalasi (Docker)
+## Instalasi (Docker)
 
 Metode ini paling bersih dan aman untuk sistem OpenWrt.
 
@@ -108,7 +108,7 @@ eksternal / SD Card Anda.
 
 ------------------------------------------------------------------------
 
-## ðŸ“‚ Struktur Direktori
+## Struktur Direktori
 
     /st4-player
     â”œâ”€â”€ app.py              # Logic Utama (Flask)
@@ -122,7 +122,7 @@ eksternal / SD Card Anda.
 
 ------------------------------------------------------------------------
 
-## ðŸ“¡ API Endpoints & Serial
+## API Endpoints & Serial
 
 ### HTTP API
 
@@ -140,13 +140,13 @@ eksternal / SD Card Anda.
 
 Baudrate: **115200**
 
-#### STB â†’ ESP (JSON Line)
+#### STB ESP (JSON Line)
 
 ``` json
 {"title": "Song", "artist": "Band", "status": "playing", "volume": 50}
 ```
 
-#### ESP â†’ STB (String Command + newline)
+#### ESP STB (String Command + newline)
 
     cmd:play
     cmd:pause
@@ -156,7 +156,7 @@ Baudrate: **115200**
 
 ------------------------------------------------------------------------
 
-## ðŸ› Troubleshooting
+## Troubleshooting
 
 ### Build Error (Network)
 
@@ -191,7 +191,7 @@ Selalu gunakan flag:
 
 ------------------------------------------------------------------------
 
-## ðŸ“œ License
+## License
 
 Project ini dibuat untuk edukasi dan hobi.
 
